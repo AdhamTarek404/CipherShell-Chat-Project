@@ -1,808 +1,315 @@
-# AI-Assisted Network Traffic Forensics
-### Intrusion Detection System — Complete Project Guide
+# AI-Assisted Network Traffic Forensics for Intrusion Detection — Project Guide
+
+This document explains what **this repository (DLDS — Digital Leak Detection System / SOC dashboard)** does in relation to the course-style project brief (Zeek, Wireshark, Suricata, ML, ELK), how to run it, which files matter most, and **line-by-line** commentary for the core detection and training code.
 
 ---
 
-## Table of Contents
+## 1. How this repo matches your project brief
 
-1. [The Idea](#1-the-idea)
-2. [System Blueprint](#2-system-blueprint)
-3. [What It Does](#3-what-it-does)
-4. [Project Structure](#4-project-structure)
-5. [How to Run It](#5-how-to-run-it)
-6. [What Happens When You Run It](#6-what-happens-when-you-run-it)
-7. [File-by-File Code Breakdown](#7-file-by-file-code-breakdown)
-   - [run.py — The Launcher](#runpy--the-launcher)
-   - [pipeline/main.py — The Real-Time Pipeline](#pipelinemainpy--the-real-time-pipeline)
-   - [pipeline/normalizer.py — The Event Schema](#pipelinenormalizerpy--the-event-schema)
-   - [pipeline/correlator.py — The Event Correlator](#pipelinecorrelatorpy--the-event-correlator)
-   - [pipeline/inference.py — The AI Classifier](#pipelineinferencepy--the-ai-classifier)
-   - [ml/train_model.py — The Model Trainer](#mltrainmodelpy--the-model-trainer)
+| Brief item | What you do in practice | Where it lives in this project |
+|------------|-------------------------|--------------------------------|
+| **Real-time IDS** | Zeek + Suricata + auditd feed a Python engine; Suricata rules produce alerts; correlation detects exfil patterns | `detection-engine/` (`zeek_stream.py`, `suricata_stream.py`, `process_monitor.py`, `correlator.py`) |
+| **Wireshark — packet capture** | PCAPs can be captured offline and logs/telemetry fed into `data/`; tshark/PCAP workflow is documented in root `README.md` | `data/pcaps/`, `simulation/`, `pipeline/ingest_wireshark.py` |
+| **Zeek — network forensics** | Tails `conn.log`, parses flows into normalized network events | `detection-engine/zeek_stream.py`, `parser_zeek.py` |
+| **Suricata — IDS/IPS** | Tails `eve.json`, maps alerts to processes via socket tables | `detection-engine/suricata_stream.py`, `run_services.sh` |
+| **TensorFlow / Scikit-learn** | Production training path uses **scikit-learn RandomForest** (not TensorFlow in-tree) | `ml/train_model.py`, `detection-engine/ai_engine.py`, `pipeline/inference.py` |
+| **ELK — visualization** | Docker Compose brings up Elasticsearch, Logstash, Kibana; Filebeat ships normalized JSON | `docker-compose.elk.yml`, `elk/` |
+| **Simulated traffic / validation** | Scripts for tcpreplay and health checks | `simulation/`, `scripts/`, `detection-engine/traffic-generator.sh` |
 
----
+**Important nuance — two ML code paths:**
 
-## 1. The Idea
+- **`detection-engine/ai_engine.py`** — Used by the **live correlator** (`correlator.py`). It loads `rf_model.pkl` but its default feature vector is small (`bytes_sent`, ports, `severity_score`, `is_sensitive_file`). If your saved bundle was trained by `ml/train_model.py` with the **full** feature list, you should use the same feature schema in `AIEngine` or route scoring through the **pipeline** `MLEngine`, which matches `train_model.py`.
+- **`pipeline/inference.py` (`MLEngine`)** — Aligns with **`ml/train_model.py`**: same encoders and feature columns (`protocol_enc`, `flags_enc`, DNS/HTTP/TLS presence, etc.).
 
-> **One-line summary:** Watch all network traffic in real time, feed it to an AI, and raise an alarm if something looks like an attack.
-
-Most cyber attacks leave traces in network traffic — unusual ports, large data transfers, known attack signatures. The problem is there is too much traffic for a human to watch manually.
-
-This project automates that by combining three things:
-
-| Layer | What it does |
-|---|---|
-| **Network sensors** | Zeek and Suricata watch traffic and write structured logs |
-| **AI model** | A trained Random Forest classifies every connection as benign, suspicious, or malicious |
-| **Pipeline** | Python glues it all together in real time and ships results to logs and ELK |
-
-The result is a system that can spot DDoS attacks, malware communications, port scans, and unauthorized access — automatically — and explain *why* it flagged something.
+For coursework, state clearly which path you run: **“host sensor + correlator”** vs **“offline log pipeline + ELK.”**
 
 ---
 
-## 2. System Blueprint
+## 2. What the project does (plain language)
 
-```
-                        NETWORK TRAFFIC
-                              |
-              ┌───────────────┼───────────────┐
-              |               |               |
-           ZEEK            SURICATA       WIRESHARK
-      (connection         (IDS alerts    (PCAP files /
-       metadata)           + flows)       tshark)
-              |               |               |
-              └───────────────┼───────────────┘
-                              |
-                    ┌─────────▼─────────┐
-                    │    NORMALIZER     │
-                    │  unified schema   │
-                    │ (every event gets │
-                    │  same fields)     │
-                    └─────────┬─────────┘
-                              |
-                    ┌─────────▼─────────┐
-                    │    CORRELATOR     │
-                    │  matches Suricata │
-                    │  alerts to Zeek   │
-                    │  flow data        │
-                    └─────────┬─────────┘
-                              |
-                    ┌─────────▼─────────┐
-                    │    ML ENGINE      │
-                    │  Random Forest    │
-                    │                   │
-                    │  benign     0–40% │
-                    │  suspicious 40–70%│
-                    │  malicious  70%+  │
-                    └─────────┬─────────┘
-                              |
-              ┌───────────────┼───────────────┐
-              |               |               |
-       CONSOLE ALERT     JSON LOG         ELK STACK
-    (WARNING printed)  audit_events     (Kibana dashboard
-                       .json + .csv      + Elasticsearch)
+1. **Sensors** observe the network and host: Zeek connection logs, Suricata EVE (alerts and metadata), and auditd-style process/file events.
+2. A **correlation engine** joins what process touched sensitive files with how many bytes left the host to the internet, and enriches Suricata alerts with owning PID/command when possible.
+3. An **ML classifier** (Random Forest, trained from your CSV datasets) labels traffic/events as benign / suspicious / malicious and attaches **evidence strings** for analysts.
+4. **Laravel** exposes a signed HTTP API, stores events, and drives a **real-time SOC dashboard** (Reverb/WebSockets).
+5. Optional **Kafka + Elastic stack** durably streams normalized events for **Kibana** dashboards and forensic search.
+
+---
+
+## 3. Architecture (data flow)
+
+```mermaid
+flowchart LR
+  subgraph sensors [Sensors]
+    Z[Zeek conn.log]
+    S[Suricata eve.json]
+    A[auditd / process monitor]
+  end
+  subgraph engine [detection-engine]
+    ZS[zeek_stream]
+    SS[suricata_stream]
+    PM[process_monitor]
+    COR[Correlator]
+    AI[AIEngine]
+    ZS --> COR
+    SS --> COR
+    PM --> COR
+    COR --> AI
+  end
+  subgraph api [Laravel]
+    API["/api/dlds/events"]
+    DB[(DB)]
+    UI[Dashboard]
+  end
+  AI -->|HTTP POST signed| API
+  API --> DB
+  API --> UI
+  subgraph pipeline [pipeline optional]
+    PZ[ingest_zeek]
+    PS[ingest_suricata]
+    ML[MLEngine]
+    OM[OutputManager / Kafka]
+    PZ --> ML
+    PS --> ML
+    ML --> OM
+  end
+  OM -->|Filebeat| ELK[ELK Stack]
 ```
 
 ---
 
-## 3. What It Does
+## 4. How to run
 
-### Step 1 — Capture
-Zeek and Suricata sit on the network interface and write structured logs every time a connection is made. Zeek captures metadata (who connected to whom, how many bytes, how long). Suricata fires alerts when traffic matches known attack signatures.
+### 4.1 Prerequisites
 
-### Step 2 — Normalize
-Every log line from every sensor is different. The normalizer converts all of them into one consistent Python dictionary so the rest of the pipeline does not need to care about the source.
+- **PHP 8.3+**, **Composer**, **Node/npm**, **Python 3**, **Docker** (for Kafka/ELK), and on Linux: **Zeek**, **Suricata**, **auditd** (see root `README.md`).
+- Copy **`.env.example`** → **`.env`**, run `php artisan key:generate`, configure database and `DLDS_API_KEY` / `DLDS_HMAC_SECRET`.
 
-### Step 3 — Correlate
-When Suricata fires an alert, it often lacks detailed flow data (bytes, duration). The correlator looks up whether Zeek saw the same connection (matched by src IP, dst IP, src port, dst port) and merges that data in — giving the AI richer features to work with.
+### 4.2 Laravel (dashboard + API)
 
-### Step 4 — Classify
-The AI model — a Random Forest trained on 2000 labeled network events — receives 11 numerical features extracted from the event and outputs a label plus a confidence score:
-
-- **benign** — normal traffic, no action needed
-- **suspicious** — unusual pattern, logged for review
-- **malicious** — known attack behavior, console alarm raised immediately
-
-It also explains its reasoning in plain English: *"High IDS severity | Anomalous high byte transfer | Suspicious destination port"*
-
-### Step 5 — Output
-Every classified event is written to:
-- `data/logs/audit_events.json` — one JSON object per line, for ELK ingestion
-- `data/logs/audit_events.csv` — spreadsheet format for manual review
-- **Console** — WARNING printed for malicious, INFO for suspicious, stats every 50 events
-
-### Step 6 — Visualize
-Filebeat (configured in `elk/`) tails the JSON log and ships events to Elasticsearch. Kibana then lets you build dashboards showing traffic over time, alert counts, top attacker IPs, etc.
-
----
-
-## 4. Project Structure
-
-```
-DigitalForensics/
-│
-├── run.py                        The single entry point for everything
-├── check.py                      Health check — tests all components
-├── requirements.txt              pip install -r requirements.txt
-├── .env                          Configuration (log paths, ELK URLs)
-├── docker-compose.elk.yml        Start Elasticsearch + Logstash + Kibana
-│
-├── pipeline/                     High-level real-time processing
-│   ├── main.py                   Orchestrates all threads
-│   ├── normalizer.py             Converts any log into unified schema
-│   ├── correlator.py             Merges Zeek + Suricata on same flow
-│   ├── inference.py              ML model wrapper — classifies events
-│   ├── output_manager.py         Writes to JSON + CSV logs
-│   ├── ingest_zeek.py            Tails Zeek conn.log
-│   ├── ingest_suricata.py        Tails Suricata eve.json
-│   └── ingest_wireshark.py       Parses PCAP files with tshark
-│
-├── ml/
-│   ├── train_model.py            Trains the Random Forest model
-│   └── models/
-│       ├── rf_model.pkl          Trained model bundle (created after training)
-│       └── model_metadata.json   Training metrics and feature list
-│
-├── detection-engine/             Low-level sensor stream handlers
-│   ├── main.py                   Alternative entry (Zeek + Suricata + correlator)
-│   ├── ai_engine.py              Full AI engine with safety overrides
-│   ├── correlator.py             Correlation + detection loop
-│   ├── zeek_stream.py            Zeek log reader
-│   ├── suricata_stream.py        Suricata EVE reader
-│   ├── dataset.csv               Labeled training dataset (2000 events)
-│   └── models/                   Mirror model location
-│
-├── simulation/
-│   ├── ingest_pcap.sh            Run Zeek + Suricata on an offline PCAP
-│   └── tcpreplay_attack.sh       Replay attack traffic on a live interface
-│
-├── data/
-│   ├── logs/                     All output lands here
-│   │   ├── audit_events.json     Main enriched event log (JSON lines)
-│   │   ├── audit_events.csv      Same events in CSV format
-│   │   ├── zeek_offline/         Offline Zeek logs
-│   │   └── suricata_offline/     Offline Suricata logs (sample data here)
-│   └── pcaps/                    Put your .pcap capture files here
-│
-└── elk/
-    ├── filebeat/                 Filebeat config — ships JSON log to ELK
-    ├── logstash/                 Logstash pipeline config
-    └── elasticsearch/            Index template
+```bash
+composer install
+npm install
+cp .env.example .env
+php artisan key:generate
+php artisan migrate
+npm run build
+php artisan serve
+# In another terminal (real-time UI):
+php artisan reverb:start --host=127.0.0.1 --port=8080
 ```
 
----
+Dashboard: `http://127.0.0.1:8000`  
+Kibana (if ELK is up): `http://127.0.0.1:5601`
 
-## 5. How to Run It
+### 4.3 Train the ML model (real CSV data required)
 
-### Prerequisites
-
+```bash
+cd ml
+python -m venv .venv
+# Windows: .venv\Scripts\activate
+# Linux/macOS: source .venv/bin/activate
+pip install pandas scikit-learn joblib numpy
+python train_model.py --dataset-file path\to\your_dataset.csv
+# or: python train_model.py --dataset-dir path\to\csv_folder
 ```
-Python 3.10+
+
+Artifacts: `ml/models/rf_model.pkl`, `ml/models/model_metadata.json`.  
+Copy the pickle to `detection-engine/models/rf_model.pkl` if you want the host engine to load it from that folder.
+
+### 4.4 Detection engine (Python, live sensors)
+
+```bash
+cd detection-engine
 pip install -r requirements.txt
-Docker (optional, for ELK visualisation)
+# Set DLDS_API_URL or LARAVEL_API_URL to your ingest endpoint, e.g.:
+#   http://127.0.0.1:8000/api/dlds/events
+export DLDS_API_KEY=your-key
+export DLDS_HMAC_SECRET=your-secret
+# Optional: allow deterministic scoring without a model (labs only):
+# export DLDS_ALLOW_MOCK_MODEL=true
+python main.py
 ```
 
----
+Host service bootstrap (Zeek/Suricata) is **skipped by default** (`DLDS_SKIP_RUN_SERVICES` defaults true). To run `run_services.sh`, set `DLDS_SKIP_RUN_SERVICES=false` (Linux, requires sudo and installed packages).
 
-### Step 1 — Train the AI Model
+### 4.5 Forensic pipeline (offline log tail + optional Kafka)
+
+From **repository root**:
 
 ```bash
-python run.py --mode train
+# Windows PowerShell example:
+$env:PYTHONPATH = (Get-Location).Path
+$env:PIPELINE_KAFKA_ENABLED = "true"
+$env:PIPELINE_KAFKA_BOOTSTRAP_SERVERS = "127.0.0.1:19092"
+python pipeline/main.py
 ```
 
-Reads `detection-engine/dataset.csv` and trains a Random Forest classifier.
-Saves the model to `ml/models/rf_model.pkl`.
-
-> Only needs to be done once. The model persists on disk.
-
----
-
-### Step 2 — (Optional) Start ELK for Visualisation
+Start stacks:
 
 ```bash
-docker compose -f docker-compose.elk.yml up -d
+docker compose --project-name dlds_kafka -f docker-compose.kafka.yml up -d
+./scripts/create_kafka_topics.sh
+docker compose --project-name dlds_elk -f docker-compose.elk.yml up -d
 ```
 
-| URL | What it is |
-|---|---|
-| http://127.0.0.1:5601 | Kibana — visual dashboards |
-| http://127.0.0.1:9200 | Elasticsearch — event storage |
+### 4.6 `ran.sh` (Linux-oriented “one script”)
+
+`ran.sh` assumes **bash**, **XAMPP** at `/opt/lampp`, **`$HOME/Downloads/DigitalForensics`** as `PROJECT_DIR`, and **`x-terminal-emulator`** for multiple terminals. On **Windows**, use **WSL** or follow the **manual** steps above and adjust paths. For a local clone at `X:\DigitalForensics`, edit `PROJECT_DIR` inside `ran.sh` or ignore the script and use `README.md` “Manual” section.
 
 ---
 
-### Step 3 — Run the Real-Time Pipeline
+## 5. Most important files and roles
 
-```bash
-python run.py --mode pipeline
-```
-
-Starts tailing logs and classifying every event that comes in.
-
----
-
-### Step 4 — (Optional) Analyse a PCAP File
-
-```bash
-python run.py --mode pcap --pcap data/pcaps/your_capture.pcap
-```
-
-Requires `tshark` to be installed.
-
----
-
-### Step 5 — Verify Everything Works
-
-```bash
-python check.py
-```
+| Path | Role |
+|------|------|
+| `detection-engine/main.py` | Process entrypoint: optional service bootstrap, HTTP test event, worker threads for Zeek/Suricata/auditd streams and periodic `detect()`. |
+| `detection-engine/correlator.py` | Merges process + network + IDS observations; rule-based exfil detection; calls `AIEngine`; POSTs to Laravel; optional SQLite. |
+| `detection-engine/ai_engine.py` | Loads `rf_model.pkl`, feature extraction, mock/lab fallback, **safety overrides** for critical IDS keywords. |
+| `detection-engine/config.py` | Env loading, API URL, Zeek/Suricata paths, **HMAC-signed** JSON ingest headers, HTTP session with retries. |
+| `detection-engine/zeek_stream.py` | Follows `conn.log`, handles rotation, yields `type=network` events. |
+| `detection-engine/suricata_stream.py` | Follows `eve.json`, yields `type=alert` / network metadata. |
+| `ml/train_model.py` | End-to-end training: CSV ingest, feature engineering, RandomForest, metrics, saves bundle + metadata. |
+| `pipeline/main.py` | Alternative real-time pipeline: tail logs, normalize, correlate, **`MLEngine`**, write JSON / Kafka, HTTP ingest. |
+| `pipeline/inference.py` | **`MLEngine`**: loads training bundle, encodes protocol/flags, `predict_proba`, evidence summary. |
+| `routes/api.php` | Laravel `POST /api/dlds/events`, stats, RBAC. |
+| `docker-compose.elk.yml` / `docker-compose.kafka.yml` | Infra for ELK and Kafka. |
+| `elk/filebeat/filebeat.yml` | Ships logs toward Kafka/Logstash. |
+| `scripts/dlds_health_check.sh` | Verifies routing, DB, Reverb, Kafka, Elasticsearch, etc. |
 
 ---
 
-## 6. What Happens When You Run It
+## 6. Line-by-line reference (core files)
 
-### `python run.py --mode train`
+### 6.1 `detection-engine/main.py`
 
-```
-Training Random Forest model from: detection-engine/dataset.csv
-
---- Model Evaluation ---
-Accuracy:  0.8950
-Precision: 0.8917
-Recall:    0.8950
-F1-Score:  0.8918
-
-               precision    recall  f1-score
-      benign       0.93      0.96      0.94
-   malicious       0.82      0.69      0.75
-  suspicious       0.90      0.95      0.92
-
-[OK] Model bundle saved to ml/models/rf_model.pkl
-```
-
-The model learns patterns like: *"high bytes + suspicious port + high severity = malicious"*.
+| Lines | What happens |
+|-------|----------------|
+| 1–4 | Module docstring: entrypoint runs Zeek, Suricata, auditd ingestion and correlation in worker threads. |
+| 6–14 | Future annotations and stdlib imports (`logging`, `subprocess`, `threading`, `time`, `datetime`, `Path`, typing). |
+| 16 | Third-party: `requests.Session` for HTTP. |
+| 18–25 | Local `config` helpers (session, URL, timeouts, env bool/float, logging setup). |
+| 26–29 | Correlator and three stream sources: process monitor, Suricata, Zeek. |
+| 31 | Module logger. |
+| 33–34 | Allow-lists for event `type` and `severity` strings. |
+| 37–69 | `_run_services_script`: unless `DLDS_SKIP_RUN_SERVICES` is false, skips bash `run_services.sh`; otherwise runs it with timeout and optional verbose stdout/stderr. |
+| 72–76 | `_as_int` parses integers safely with fallback. |
+| 79–116 | `_normalize_event`: coerces type/severity, truncates description, maps alternate field names, **forces fresh UTC timestamp** (avoids dedup hash collisions on replay), builds Laravel-friendly dict. |
+| 119–148 | `send_event`: POSTs normalized payload with **signed headers**; logs status; returns success on 200/201. |
+| 151–158 | `_safe_worker`: restart loop if worker callback throws. |
+| 161–240 | `main`: sets logging, optional `run_services`, builds HTTP session, optional startup **test event** (`DLDS_TEST_EVENT`), creates `Correlator`, defines four worker lambdas (Zeek/Suricata/process enumerate into `correlator.handle_event`; detect loop calls `correlator.detect()`), starts daemon threads, main loop watches thread health, Ctrl+C sets stop and joins. |
+| 243–244 | Standard `if __name__ == "__main__": main()` guard. |
 
 ---
 
-### `python run.py --mode pipeline`
+### 6.2 `detection-engine/ai_engine.py`
 
-The system starts, two background threads launch:
-
-```
-2026-05-11 18:54:51 [INFO] Pipeline ready. Logs -> data/logs
-2026-05-11 18:54:51 [INFO] Starting Real-Time Forensics Pipeline...
-2026-05-11 18:54:51 [INFO] Tailing Zeek log: data/logs/zeek_offline/conn.log
-2026-05-11 18:54:51 [INFO] Tailing Suricata EVE: data/logs/suricata_offline/eve.json
-```
-
-Every 50 events a stats line prints:
-
-```
-2026-05-11 18:54:53 [INFO]  [STATS] Processed 50 events | benign=48 suspicious=2 malicious=0
-2026-05-11 18:54:55 [INFO]  [STATS] Processed 100 events | benign=95 suspicious=4 malicious=1
-```
-
-When something malicious is found:
-
-```
-2026-05-11 18:54:56 [WARNING] [MALICIOUS] 192.168.1.100:54321 -> 10.0.0.1:4444
-                               sig=ET TROJAN Generic  conf=0.86
-                               Evidence: High IDS severity | Anomalous high byte transfer |
-                               Suspicious destination port commonly used by Trojans
-```
-
-On shutdown (Ctrl+C):
-
-```
-2026-05-11 18:55:10 [INFO] Pipeline stopped.
-                           Final counts: total=191 benign=185 suspicious=5 malicious=1
-```
+| Lines | What happens |
+|-------|----------------|
+| 1–7 | Imports: logging, `os`, typing, `pandas`. |
+| 9–31 | `_OVERRIDE_KEYWORDS` / `_MALICIOUS_OVERRIDE_KEYWORDS`: uppercase tokens (e.g. EXPLOIT, C2) used in safety logic. |
+| 35–47 | `AIEngine.__init__`: default feature names, reads `DLDS_ALLOW_MOCK_MODEL`, calls `_load_model()`. |
+| 49–78 | `_load_model`: prefers `detection-engine/models/rf_model.pkl`, else `ml/models/rf_model.pkl`; `joblib.load` supports dict bundle (`model`, `features`, `model_version`) or raw estimator. |
+| 80–104 | `extract_features`: numeric severity → `severity_score`; sensitive path heuristic (`/etc/` or “secret” in path). |
+| 106–116 | `_evidence`: human-readable reasons from bytes, severity, sensitive file flag. |
+| 118–146 | `_mock_predict`: **lab-only** deterministic score from features → label + reason. |
+| 148–159 | `_aligned_anomaly_score`: maps label to consistent anomaly scale. |
+| 161–173 | `_first_keyword`: scans alert_type + description for override keywords. |
+| 175–232 | `_apply_safety_override`: for `type=alert`, bumps label/confidence when severity + signature/keywords demand (e.g. CRITICAL cannot be benign). |
+| 234–295 | `predict`: extract features + evidence; if no model → `unscored` or mock; else build one-row `DataFrame`, `predict` / `predict_proba`, map class index or string to benign/suspicious/malignant, attach reason + evidence + version; always pass through `_apply_safety_override`. |
 
 ---
 
-## 7. File-by-File Code Breakdown
+### 6.3 `detection-engine/correlator.py` (selected sections)
+
+| Lines | What happens |
+|-------|----------------|
+| 1–16 | Docstring + imports (json, sqlite, threading, collections, pathlib, requests Session, local config, `NetMapper`, `rules`). |
+| 40–45 | `_iso_from_zeek_ts` converts Zeek unix time string to ISO UTC. |
+| 47–66 | `_empty_record` template for new correlated events. |
+| 69–93 | `Correlator.__init__`: locks, per-PID deques for file accesses, byte counters, HTTP/SQLite config, logging. |
+| 97–111 | `handle_event`: dispatches by `type` (`process` / `network` / `alert`); in `emit_mode=all`, normalizes observation and emits immediately. |
+| 113–125 | `_handle_process`: records recent files per PID (max 512). |
+| 127–153 | `_handle_network`: maps 5-tuple through `NetMapper` to PID, accumulates **bytes_sent** and last remote IP. |
+| 155–197 | `_handle_suricata`: chooses “local” side using private IP rules, resolves PID, builds enriched **alert** record, emits. |
+| 199–262 | `_normalize_observation`: converts raw stream dicts into canonical record layout per type. |
+| 266–316 | `detect`: finds PIDs that touched **sensitive** files and exceeded byte threshold toward **outbound** candidates; emits **Data Exfiltration** alert once per (pid, path) key. |
+| 320–340 | `_emit`: lazy-init `AIEngine`, merges AI fields into record, **prints JSON line** (stdout), POSTs if API URL set, else SQLite if path set. |
+| 342–370 | `_post_http`: signed POST with cooldown on failures. |
+| 372–385 | `_payload_for_api`: refreshes timestamp to “now” for API dedup behavior. |
+| 387–459 | `_persist_sqlite`: creates `dlds_events` table if needed, inserts full row including AI fields. |
 
 ---
 
-### `run.py` — The Launcher
+### 6.4 `ml/train_model.py`
 
-The single entry point. Accepts a `--mode` argument and routes to the right component.
-
-```python
-import argparse
-import sys
-import os
-```
-Standard library imports. `argparse` parses command-line arguments. `sys` and `os` for paths.
-
-```python
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-```
-Adds the project root to Python's import search path so `pipeline`, `ml`, etc. can be imported regardless of where you run the script from.
-
-```python
-def run_pipeline():
-    from pipeline.main import RealTimePipeline
-    RealTimePipeline().start()
-```
-Imports and starts the real-time pipeline. Imported inside the function so it only loads when needed.
-
-```python
-def run_train(dataset: str):
-    from ml.train_model import train
-    train(dataset_file=dataset, dataset_dir=None)
-```
-Calls the training function directly, passing the CSV dataset path.
-
-```python
-def run_pcap(pcap_path: str):
-    from pipeline.ingest_wireshark import ingest_wireshark
-    from pipeline.output_manager import OutputManager
-    out = OutputManager("data/logs")
-    count = ingest_wireshark(pcap_path, out)
-```
-Creates an output manager (writes to disk), then runs tshark on the PCAP file and processes every packet through the pipeline.
-
-```python
-parser = argparse.ArgumentParser(description="DLDS IDS Launcher")
-parser.add_argument("--mode", choices=["pipeline", "engine", "train", "pcap"], default="pipeline")
-parser.add_argument("--dataset", default="detection-engine/dataset.csv")
-parser.add_argument("--pcap", default="")
-args = parser.parse_args()
-```
-Defines the four modes. `--dataset` defaults to the included dataset so training works out of the box. `--pcap` is only required when mode is `pcap`.
+| Lines | What happens |
+|-------|----------------|
+| 1–20 | argparse + json + sklearn metrics + preprocessing + RandomForest. |
+| 22–28 | Paths: `ml/models`, `rf_model.pkl`, `model_metadata.json`, mkdir. |
+| 31–35 | `_first_present`: picks first existing column from candidates. |
+| 38–77 | Label column inference + `_normalize_label` maps many dataset conventions to benign/suspicious/malicious. |
+| 80–137 | `_build_features`: ports, protocol string, bytes, duration, severity, frame length, tcp flags, **DNS/HTTP/TLS presence** flags from various column name aliases (CIC/UNSW style). |
+| 141–158 | `_load_dataset`: one file or directory of CSVs, tags `__dataset_source`. |
+| 161–247 | `train`: load data, require label col, encode protocol + tcp_flags with `LabelEncoder`, build `feature_cols`, stratified split, fit `RandomForestClassifier` (300 trees, balanced subsample), print report, `joblib.dump` **bundle** (model + encoders + feature list + version), write JSON **metadata** with metrics and label distribution. |
+| 250–268 | CLI: `--dataset-file`, `--dataset-dir`, env fallbacks `DLDS_TRAIN_DATASET_FILE` / `DIR`. |
 
 ---
 
-### `pipeline/main.py` — The Real-Time Pipeline
+### 6.5 `pipeline/main.py`
 
-The heart of the system. Runs two threads that continuously read logs and classify every event.
-
-```python
-import os, sys, time, threading, logging
-```
-`threading` runs Zeek and Suricata readers in parallel. `time` drives the main loop. `logging` handles all console output.
-
-```python
-from pipeline.ingest_zeek     import tail_zeek_json
-from pipeline.ingest_suricata import tail_suricata_eve
-from pipeline.normalizer      import normalize_event
-from pipeline.correlator      import Correlator
-from pipeline.inference       import MLEngine
-from pipeline.output_manager  import OutputManager
-```
-Imports each specialist module. Every module has one job:
-- `tail_zeek_json` — reads Zeek logs line by line, forever
-- `tail_suricata_eve` — reads Suricata logs line by line, forever
-- `normalize_event` — converts raw log into unified dictionary
-- `Correlator` — links Suricata alerts to Zeek flow data
-- `MLEngine` — wraps the trained model
-- `OutputManager` — writes to JSON and CSV
-
-```python
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[logging.StreamHandler(sys.stdout)],
-    force=True,
-)
-```
-Sets up logging to print to stdout with timestamps. `force=True` overrides any logging already configured by imported libraries. `sys.stdout` ensures output is not buffered.
-
-```python
-ZEEK_LOG      = os.getenv("ZEEK_LOG_PATH",     "data/logs/zeek_offline/conn.log")
-SURICATA_LOG  = os.getenv("SURICATA_LOG_PATH", "data/logs/suricata_offline/eve.json")
-LOCAL_LOG_DIR = os.getenv("LOCAL_LOG_DIR",     "data/logs")
-```
-Log paths are read from environment variables. If not set, sensible defaults are used. Change these in `.env` to point to live Zeek/Suricata logs.
-
-```python
-class RealTimePipeline:
-    def __init__(self):
-        self.correlator = Correlator(time_window_seconds=30)
-```
-Creates a correlator with a 30-second memory window. Events older than 30 seconds are evicted from the cache to prevent memory growth.
-
-```python
-        self.ml_engine  = MLEngine()
-        self.output     = OutputManager(LOCAL_LOG_DIR)
-```
-Loads the trained model from disk. Creates the output manager pointed at the log directory.
-
-```python
-        self._counts = {"benign": 0, "suspicious": 0, "malicious": 0, "unscored": 0}
-        self._total  = 0
-```
-Running counters for the stats summary printed every 50 events.
-
-```python
-        if not self.ml_engine.is_loaded:
-            logging.warning("AI model not found — run: python run.py --mode train")
-```
-Warns the user immediately if training was never done, before any events come in.
-
-```python
-    def process_event(self, event: dict):
-        enriched = self.ml_engine.classify(event)
-        self.output.write_event(enriched)
-```
-Every event passes through here. `classify` adds `ml_label`, `ml_confidence`, and `evidence_summary` fields to the dictionary. `write_event` appends it to the JSON and CSV files.
-
-```python
-        label = enriched.get("ml_label", "unscored")
-        self._counts[label] = self._counts.get(label, 0) + 1
-        self._total += 1
-```
-Increments the appropriate counter and the total.
-
-```python
-        src = f"{enriched.get('src_ip','?')}:{enriched.get('src_port','?')}"
-        dst = f"{enriched.get('dst_ip','?')}:{enriched.get('dst_port','?')}"
-        sig = enriched.get("alert_signature", "") or enriched.get("sensor", "")
-```
-Builds human-readable source/destination strings and finds the best available signature label for the log line.
-
-```python
-        if label == "malicious":
-            logging.warning("[MALICIOUS] %s -> %s  sig=%s  conf=%.2f  | %s", ...)
-        elif label == "suspicious":
-            logging.info("[SUSPICIOUS] %s -> %s  sig=%s  conf=%.2f", ...)
-        elif self._total % 50 == 0:
-            logging.info("[STATS] Processed %d events | ...", ...)
-```
-Three-tier output: malicious events get a WARNING (visible even in quiet configs), suspicious events get INFO, and every 50th benign event prints a progress line so you know the system is alive.
-
-```python
-    def _consume_zeek(self):
-        for raw in tail_zeek_json(ZEEK_LOG):
-            normalized = normalize_event("zeek", raw)
-            self.correlator.add_zeek_event(normalized)
-            self.process_event(normalized)
-```
-Infinite loop — reads the next Zeek log line, normalizes it, stores it in the correlator's memory (so Suricata can look it up later), then classifies it.
-
-```python
-    def _consume_suricata(self):
-        for raw in tail_suricata_eve(SURICATA_LOG):
-            normalized = normalize_event("suricata", raw)
-            correlated = self.correlator.correlate_suricata_alert(normalized)
-            self.process_event(correlated)
-```
-Same as Zeek but the extra step `correlate_suricata_alert` looks up whether Zeek already saw this connection and merges in the byte/duration data.
-
-```python
-    def start(self):
-        threads = [
-            threading.Thread(target=self._consume_zeek,     daemon=True, name="zeek"),
-            threading.Thread(target=self._consume_suricata, daemon=True, name="suricata"),
-        ]
-        for t in threads:
-            t.start()
-```
-Launches both readers as daemon threads. `daemon=True` means they automatically die when the main program exits — no hanging processes.
-
-```python
-        try:
-            while True:
-                time.sleep(1)
-        except KeyboardInterrupt:
-            logging.info("Pipeline stopped. Final counts: ...")
-```
-The main thread does nothing except sleep and wait for Ctrl+C. On exit it prints the final summary of how many events were processed.
+| Lines | What happens |
+|-------|----------------|
+| 1–6 | Imports ingest modules, normalizer, correlator, `MLEngine`, `OutputManager`, `HTTPIngester`. |
+| 17 | Basic logging config. |
+| 19–23 | Env paths for Zeek JSON log, Suricata EVE, auditd log, local output dir. |
+| 25–42 | `RealTimePipeline.__init__`: pipeline `Correlator` (30s window), `MLEngine`, `OutputManager`, `HTTPIngester`; logs Kafka status. |
+| 44–57 | `process_event`: `classify` with ML, write local files, POST to API, log warnings for malicious/suspicious. |
+| 59–79 | `consume_*`: three generators tailing logs → `normalize_event` → correlator hooks → `process_event`. |
+| 81–96 | `start`: daemon threads for three consumers; main sleep loop; Ctrl+C flushes Kafka sink. |
+| 98–101 | `__main__`: instantiate and `start()`. |
 
 ---
 
-### `pipeline/normalizer.py` — The Event Schema
+### 6.6 `pipeline/inference.py` — `MLEngine`
 
-Every sensor produces a different JSON format. This file translates all of them into one consistent dictionary.
-
-```python
-def normalize_event(sensor: str, raw_event: dict) -> dict:
-```
-Takes the sensor name (`"zeek"`, `"suricata"`, `"wireshark"`) and the raw dictionary parsed from the log line.
-
-```python
-    normalized = {
-        "timestamp": "",  "sensor": sensor,  "flow_id": "",
-        "src_ip": "",     "dst_ip": "",
-        "src_port": 0,    "dst_port": 0,
-        "protocol": "",   "bytes_sent": 0,   "bytes_received": 0,
-        "duration": 0.0,  "connection_state": "",
-        "alert_signature": "", "alert_category": "",
-        "severity": 0,
-        "ml_label": "unscored", "ml_confidence": 0.0, "evidence_summary": "",
-        "process_name": "", "pid": 0, "uid": 0, "gid": 0, "file_path": "",
-    }
-```
-The blank template. Every event starts with all fields set to zero/empty. The sensor-specific block below fills in what it knows. This guarantees the ML engine always receives every field — never a `KeyError`.
-
-```python
-    if sensor == "zeek":
-        normalized["src_ip"]  = raw_event.get("id.orig_h", "")
-        normalized["dst_ip"]  = raw_event.get("id.resp_h", "")
-        normalized["src_port"] = raw_event.get("id.orig_p", 0)
-        normalized["dst_port"] = raw_event.get("id.resp_p", 0)
-        normalized["bytes_sent"]     = raw_event.get("orig_bytes", 0)
-        normalized["bytes_received"] = raw_event.get("resp_bytes", 0)
-        normalized["duration"]       = raw_event.get("duration", 0.0)
-        normalized["connection_state"] = raw_event.get("conn_state", "")
-```
-Zeek uses field names like `id.orig_h` (originator host) and `id.resp_h` (responder host). These are mapped to the plain `src_ip` / `dst_ip` names the rest of the pipeline understands.
-
-```python
-    elif sensor == "suricata":
-        normalized["dst_ip"] = raw_event.get("dest_ip", "")  # Suricata says dest_ip not dst_ip
-        alert = raw_event.get("alert", {})
-        normalized["alert_signature"] = alert.get("signature", event_type)
-        normalized["severity"]        = alert.get("severity", 0)
-        flow = raw_event.get("flow", {})
-        if isinstance(flow, dict):
-            normalized["bytes_sent"] = int(flow.get("bytes_toserver", 0) or 0)
-        dns = raw_event.get("dns", {})
-        if isinstance(dns, dict):
-            normalized["dns_query"] = dns.get("rrname", "")
-        tls = raw_event.get("tls", {})
-        if isinstance(tls, dict):
-            normalized["tls_sni"] = tls.get("sni", "")
-```
-Suricata nests its data differently. Alert details are inside an `"alert"` sub-dictionary. Flow bytes are inside a `"flow"` sub-dictionary. DNS and TLS names are nested too. This block unpacks all of that into flat fields.
-
-```python
-    elif sensor == "wireshark":
-        normalized["src_ip"]   = raw_event.get("ip.src", "")
-        normalized["dst_ip"]   = raw_event.get("ip.dst", "")
-        normalized["src_port"] = int(raw_event.get("tshark_src_port", 0))
-        normalized["protocol"] = raw_event.get("frame.protocols", "unknown")
-        normalized["bytes_sent"] = int(raw_event.get("frame.len", 0))
-```
-tshark outputs fields like `ip.src` and `frame.len`. These are mapped to the standard names. Port fields were pre-processed from `tcp.srcport` / `udp.srcport` into a single `tshark_src_port` field by `ingest_wireshark.py`.
-
-```python
-    return normalized
-```
-Returns the fully populated standard dictionary. From this point on, every part of the pipeline is sensor-agnostic.
+| Lines | What happens |
+|-------|----------------|
+| 1–3 | Imports: `os`, `joblib`, `pandas`. |
+| 5–20 | Resolve absolute path to `ml/models/rf_model.pkl`; load dict with `model`, `features`, encoders, or set unloaded. |
+| 22–26 | `_safe_encode`: unknown categorical value → `0`. |
+| 28–86 | `classify`: if unloaded → `ml_label=unscored`; else builds **X** vector matching training script order, `predict_proba`, sets `ml_label` + `ml_confidence`, appends heuristic **evidence_summary** for malicious/suspicious/benign. |
 
 ---
 
-### `pipeline/correlator.py` — The Event Correlator
+### 6.7 `detection-engine/config.py` (highlights)
 
-Zeek gives you rich flow data (bytes, duration, state). Suricata gives you attack signatures. This module combines them.
-
-```python
-class Correlator:
-    def __init__(self, time_window_seconds=10):
-        self.time_window = time_window_seconds
-        self.zeek_cache = {}
-```
-The cache is a dictionary keyed by `(src_ip, dst_ip, src_port, dst_port)` — the four-tuple that uniquely identifies a network flow. The window of 10 seconds means only recent Zeek events are kept (30 seconds in the pipeline).
-
-```python
-    def clean_cache(self):
-        current_time = time.time()
-        keys_to_delete = []
-        for key, event in self.zeek_cache.items():
-            if current_time - event.get("_ingest_time", current_time) > self.time_window:
-                keys_to_delete.append(key)
-        for key in keys_to_delete:
-            del self.zeek_cache[key]
-```
-Iterates the cache and collects expired keys, then deletes them. Done in two steps (collect then delete) because you cannot modify a dictionary while iterating it in Python.
-
-```python
-    def add_zeek_event(self, normalized_event: dict):
-        self.clean_cache()
-        normalized_event["_ingest_time"] = time.time()
-        key = (normalized_event["src_ip"], normalized_event["dst_ip"],
-               normalized_event["src_port"], normalized_event["dst_port"])
-        self.zeek_cache[key] = normalized_event
-```
-Stores each Zeek event. `_ingest_time` stamps the event with the current clock so `clean_cache` can expire it later. If the same flow appears twice, the newer entry overwrites the older one.
-
-```python
-    def correlate_suricata_alert(self, normalized_alert: dict) -> dict:
-        self.clean_cache()
-        key = (normalized_alert["src_ip"], normalized_alert["dst_ip"],
-               normalized_alert["src_port"], normalized_alert["dst_port"])
-        if key in self.zeek_cache:
-            zeek_event = self.zeek_cache[key]
-            normalized_alert["bytes_sent"]        = zeek_event.get("bytes_sent", 0)
-            normalized_alert["bytes_received"]    = zeek_event.get("bytes_received", 0)
-            normalized_alert["duration"]          = zeek_event.get("duration", 0.0)
-            normalized_alert["connection_state"]  = zeek_event.get("connection_state", "")
-        return normalized_alert
-```
-Looks up the same four-tuple in the Zeek cache. If found, copies the byte counts, duration, and connection state into the Suricata alert. This means the ML model gets richer data — it sees both the IDS signature *and* exactly how many bytes were transferred and for how long.
+| Lines | What happens |
+|-------|----------------|
+| 20–32 | Loads `.env` from `detection-engine/` and repo root once. |
+| 63–68 | `detection_api_url`: `DLDS_API_URL` then `LARAVEL_API_URL`. |
+| 129–170 | `suricata_eve_path` / `zeek_conn_log_path`: env overrides + common install paths. |
+| 173–204 | `signed_headers`: JSON body, timestamp, HMAC-SHA256 over `timestamp.body`, returns body + headers `X-API-KEY`, `X-TIMESTAMP`, `X-SIGNATURE`. |
+| 218–234 | `build_http_session`: urllib3 retry policy for transient HTTP errors. |
 
 ---
 
-### `pipeline/inference.py` — The AI Classifier
+## 7. Suggested coursework narrative
 
-Wraps the trained Random Forest model and adds human-readable explanations.
+When you write your report or defense, you can structure it as:
 
-```python
-class MLEngine:
-    def __init__(self, model_path="ml/models/rf_model.pkl"):
-        base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        abs_model_path = os.path.join(base_dir, model_path)
-```
-Resolves the model path relative to the project root, not the current working directory. This makes it work regardless of where you launch the script from.
-
-```python
-        if os.path.exists(abs_model_path):
-            data = joblib.load(abs_model_path)
-            self.model        = data['model']         # the RandomForestClassifier
-            self.features     = data['features']      # list of 11 feature names
-            self.proto_encoder = data['proto_encoder'] # encodes "tcp" -> 2, "udp" -> 1, etc.
-            self.flag_encoder  = data['flag_encoder']  # encodes TCP flags string -> int
-            self.is_loaded = True
-        else:
-            self.model     = None
-            self.is_loaded = False
-```
-The model bundle is a dictionary saved by `train_model.py` containing not just the model but also the encoders that were fitted on the training data. These must be the same encoders used at prediction time or the encoding will be wrong.
-
-```python
-    def _safe_encode(self, encoder, val):
-        val_str = str(val)
-        if val_str in encoder.classes_:
-            return encoder.transform([val_str])[0]
-        return 0
-```
-If a protocol or flag value was never seen during training, return 0 instead of crashing. This handles live traffic that contains edge cases not in the training set.
-
-```python
-    def classify(self, event: dict) -> dict:
-        if not self.is_loaded:
-            event["ml_label"] = "unscored"
-            event["ml_confidence"] = 0.0
-            event["evidence_summary"] = "AI model not found. Run training script."
-            return event
-```
-Graceful fallback. If the model file is missing, every event is labelled `unscored` instead of crashing the pipeline.
-
-```python
-        dns_pres  = 1 if str(event.get('dns_query',  '')).strip() != '' else 0
-        http_pres = 1 if str(event.get('http_host',  '')).strip() != '' else 0
-        tls_pres  = 1 if str(event.get('tls_sni',    '')).strip() != '' else 0
-```
-DNS, HTTP, and TLS fields are converted from text to presence flags (1 = present, 0 = absent). The model expects numbers, not strings.
-
-```python
-        proto_enc = self._safe_encode(self.proto_encoder, event.get('protocol', ''))
-        flags_enc = self._safe_encode(self.flag_encoder,  event.get('tcp_flags', ''))
-```
-Protocol ("tcp", "udp", "icmp") and TCP flags are encoded to integers using the same encoders that were built during training.
-
-```python
-        X = [
-            int(event.get("src_port")    or 0),   # source port number
-            int(event.get("dst_port")    or 0),   # destination port number
-            proto_enc,                             # protocol encoded as int
-            int(event.get("bytes_sent")  or 0),   # total bytes from client
-            float(event.get("duration")  or 0.0), # connection duration in seconds
-            int(event.get("severity")    or 0),   # IDS severity score (0-3)
-            int(event.get("frame_length") or event.get("bytes_sent") or 0), # packet size
-            flags_enc,                             # TCP flags encoded as int
-            dns_pres,                              # 1 if DNS query present
-            http_pres,                             # 1 if HTTP host present
-            tls_pres,                              # 1 if TLS SNI present
-        ]
-        X_df = pd.DataFrame([X], columns=self.features)
-```
-Assembles the 11 features the model was trained on into a single-row DataFrame. The column names must match exactly what was used during training.
-
-```python
-        probs      = self.model.predict_proba(X_df)[0]
-        prediction = self.model.classes_[probs.argmax()]
-        confidence = probs.max()
-```
-`predict_proba` returns three probabilities — one per class (benign, suspicious, malicious). `argmax()` picks the index with the highest probability. `classes_[index]` maps that back to the label string. `max()` is the confidence score.
-
-```python
-        event["ml_label"]      = prediction
-        event["ml_confidence"] = round(float(confidence), 4)
-```
-Writes results back into the event dictionary so everything travels together through the pipeline.
-
-```python
-        reasons = []
-        if prediction == "malicious":
-            if int(event.get("severity") or 0) >= 2:
-                reasons.append("High IDS severity")
-            if int(event.get("bytes_sent") or 0) > 50000:
-                reasons.append("Anomalous high byte transfer")
-            if int(event.get("dst_port") or 0) in [4444, 1337]:
-                reasons.append("Suspicious destination port commonly used by Trojans")
-            event["evidence_summary"] = "AI identified Malicious behavior: " + " | ".join(reasons)
-```
-Explainability. After classification, the code checks which specific features triggered the alert and assembles a plain-English explanation. Port 4444 is the default Metasploit listener port. Port 1337 is a classic backdoor port.
+1. **Environment** — test network or VM, capture with Wireshark/tshark, export or derive CSV features.  
+2. **Zeek** — `conn.log` as structured metadata for flows and volumes.  
+3. **Suricata** — signature-based alerts (`eve.json`) for known attack patterns.  
+4. **ML** — train on labeled CSV (`ml/train_model.py`), evaluate precision/recall/F1 from printed report.  
+5. **Integration** — events flow to Laravel API and optionally ELK for timeline analysis.  
+6. **Validation** — replay PCAP (`simulation/`, `tcpreplay`), compare dashboard labels vs ground truth; use `scripts/dlds_health_check.sh` for stack sanity.
 
 ---
 
-### `ml/train_model.py` — The Model Trainer
+## 8. License / safety
 
-Reads a CSV dataset, engineers features, trains a Random Forest, and saves a bundle to disk.
-
-```python
-def _normalize_label(v) -> str:
-    text = str(v).strip().lower()
-    if text in {"0", "benign", "normal"}:    return "benign"
-    if text in {"1", "suspicious"}:          return "suspicious"
-    if text in {"2", "malicious", "attack"}: return "malicious"
-    malicious_keywords = ["dos", "ddos", "exploit", "backdoor", "shellcode", "bot", ...]
-    if any(k in text for k in malicious_keywords): return "malicious"
-    return "suspicious"
-```
-Different public datasets use different label names. CIC-IDS2017 uses "BENIGN" and attack names. UNSW-NB15 uses numeric categories. This function maps all of them to the three classes the model uses.
-
-```python
-def _build_features(df: pd.DataFrame) -> pd.DataFrame:
-    out["src_port"]  = pd.to_numeric(_first_present(df, ["src_port","Source Port","sport",...]))
-    out["dst_port"]  = pd.to_numeric(_first_present(df, ["dst_port","Destination Port",...]))
-    out["bytes_sent"] = pd.to_numeric(_first_present(df, ["bytes_sent","orig_bytes",...]))
-    out["duration"]  = pd.to_numeric(_first_present(df, ["duration","dur","Flow Duration",...]))
-    out["severity"]  = pd.to_numeric(_first_present(df, ["severity","alert_severity",...]))
-    out["protocol"]  = _first_present(df, ["protocol","proto",...]).str.lower()
-    out["tcp_flags"] = _first_present(df, ["tcp_flags","Flags","flag","history"])
-    out["dns_query_presence"]  = dns_col.str.strip().ne("").astype(int)
-    out["http_host_presence"]  = http_col.str.strip().ne("").astype(int)
-    out["tls_sni_presence"]    = tls_col.str.strip().ne("").astype(int)
-```
-Different dataset column naming conventions are handled via `_first_present`, which tries multiple candidate column names and returns the first one that exists. This makes the trainer work with CIC-IDS2017, UNSW-NB15, Zeek logs, and custom datasets without modification.
-
-```python
-    clf = RandomForestClassifier(
-        n_estimators=300,         # 300 decision trees vote on each event
-        random_state=42,          # fixed seed for reproducible results
-        n_jobs=-1,                # use all CPU cores for training
-        class_weight="balanced_subsample",  # prevents the model from ignoring rare attack classes
-    )
-    clf.fit(X_train, y_train)
-```
-`n_estimators=300` means 300 independent decision trees each vote on the label. The majority vote wins. `balanced_subsample` is critical for security datasets because attack traffic is far rarer than normal traffic — without this the model would learn to call everything benign.
-
-```python
-    bundle = {
-        "model":         clf,
-        "features":      feature_cols,
-        "proto_encoder": proto_encoder,
-        "flag_encoder":  flag_encoder,
-        "model_version": "rf-prod-v2.0",
-    }
-    joblib.dump(bundle, MODEL_PATH)
-```
-All components needed at prediction time are saved together in one file. `joblib` is used instead of `pickle` because it is faster for large NumPy arrays. The encoders must be saved alongside the model — they were fitted on training data and must produce the same mapping at runtime.
-
-```python
-    metadata = {
-        "accuracy": acc, "precision": prec, "recall": rec, "f1_score": f1,
-        "label_distribution": y.value_counts().to_dict(),
-        "rows": int(len(df_raw)),
-        "trained_at": datetime.now(timezone.utc).isoformat(),
-    }
-    with open(META_PATH, "w") as f:
-        json.dump(metadata, f, indent=2)
-```
-Saves a human-readable JSON file alongside the model recording exactly when it was trained, on how many rows, and what accuracy was achieved. Useful for tracking model versions over time.
+Do not commit real secrets: replace `DLDS_API_KEY` / `DLDS_HMAC_SECRET` for each environment. The repo may contain sample keys or artifacts under `detection-engine/` — treat them as **non-production** only.
 
 ---
 
-## Quick Reference
-
-| Command | What it does |
-|---|---|
-| `python run.py --mode train` | Train the AI model |
-| `python run.py --mode pipeline` | Start real-time detection |
-| `python run.py --mode pcap --pcap file.pcap` | Analyse a PCAP file |
-| `python check.py` | Verify all components work |
-| `docker compose -f docker-compose.elk.yml up -d` | Start ELK visualisation |
-
-| URL | Service |
-|---|---|
-| http://127.0.0.1:5601 | Kibana dashboards |
-| http://127.0.0.1:9200 | Elasticsearch API |
-
-| File | Output |
-|---|---|
-| `data/logs/audit_events.json` | All classified events (JSON lines) |
-| `data/logs/audit_events.csv` | Same events in spreadsheet format |
-| `ml/models/rf_model.pkl` | Trained model bundle |
-| `ml/models/model_metadata.json` | Training metrics |
+*Generated for the DigitalForensics / DLDS codebase. For day-to-day developer docs, see `README.md` and `README_AI.md`.*
